@@ -67,7 +67,7 @@ const BRAKE_PER_LEG := 2.0
 const REVERSE_FACTOR := 0.5
 const DRAG := 0.7
 const GRIP := 6.0
-const TURN_RATE := 0.9
+const TURN_RATE := 2.7          # user-directed: snappy steering
 # Verbs (Courier traversal contract on this model). Stance is a hold: lower,
 # grip, sharper turning, lower top speed. On a steep descent with speed it
 # becomes a controlled slide with carve steering. Leap is a committed launch:
@@ -82,14 +82,21 @@ const SLIDE_ENTER_NY := 0.972   # ground normal.y below this (~13.5 deg) allows 
 const SLIDE_EXIT_NY := 0.985
 const SLIDE_DRAG := 0.08
 const SLIDE_GRIP := 1.6
-const SLIDE_TURN := 1.1
+const SLIDE_TURN := 2.0
 const SLIDE_GRAVITY := 3.0      # extra downhill pull while sliding
 const GATHER_TIME := 0.22
-const LEAP_UP := 4.2
+const LEAP_UP := 4.5
 const LEAP_FWD_BASE := 1.2
 const LEAP_FWD_SPEED := 0.35
-const LEAP_FWD_MAX := 3.2
+const LEAP_FWD_MAX := 3.5
 const LEAP_COOLDOWN := 0.7
+# Edge refusal: the machine will not walk off a real cliff without explicit
+# consent. A leap press while an edge is ahead ARMS the leap; the machine
+# then times its own takeoff at the lip. Refusal braking is capped, so
+# arriving recklessly hot can still carry you over — momentum stays honest.
+const CLIFF_DROP := 3.0         # drops deeper than this are refused (one terrace stays free)
+const CLIFF_BRAKE := 9.0        # refusal braking (m/s^2 cap)
+const CLIFF_STOP_MARGIN := 1.1  # aim to stand this far before the lip
 const AIR_STEER := 0.15
 const LAND_RETENTION_HARD := 0.82  # unbraced hard landing bleeds speed
 const HARD_LANDING_VY := 4.0
@@ -132,13 +139,18 @@ var stance_active := false
 var sliding := false
 var gathering := false
 var surface := 0                # Yard.SURF_* under the body
+var cliff_ahead := false
+var leap_armed := false
+var refusing := false
 
 var _gather_t := 0.0
+var _takeoff_t := 0.0  # suspension released briefly at launch, or the spring damper eats the leap
 var _leap_cd := 0.0
 var _leap_queued := false
 var _was_grounded := true
 var _prev_vy := 0.0
 var _slide_exit_t := 0.0
+var _cliff_dist := INF
 
 var _tick := 0
 var _log: FileAccess
@@ -186,10 +198,15 @@ func reset_state() -> void:
 	regime = Regime.WALK
 
 
-## Leap request — from input or the test harness.
+## Leap request — from input or the test harness. With an edge ahead this
+## ARMS the leap (the machine times its own takeoff at the lip); otherwise
+## it gathers and launches immediately.
 func request_leap() -> void:
 	if grounded and not gathering and _leap_cd <= 0.0:
-		_leap_queued = true
+		if cliff_ahead:
+			leap_armed = true
+		else:
+			_leap_queued = true
 
 
 func state_name() -> String:
@@ -197,6 +214,10 @@ func state_name() -> String:
 		return "air"
 	if gathering:
 		return "gather"
+	if leap_armed:
+		return "leap armed"
+	if refusing:
+		return "refusing edge"
 	if sliding:
 		return "slide"
 	if stance_active:
@@ -226,6 +247,9 @@ func _physics_process(dt: float) -> void:
 	var hit := space.intersect_ray(q)
 	var ground_dist: float = global_position.y - hit.position.y if not hit.is_empty() else INF
 	grounded = ground_dist < RIDE_HEIGHT + 0.4
+	_takeoff_t = maxf(_takeoff_t - dt, 0.0)
+	if _takeoff_t > 0.0:
+		grounded = false  # ballistic: the launch owns the body until clear
 	var ride := RIDE_HEIGHT - (STANCE_CROUCH if (stance_active or gathering) else 0.0)
 	if grounded:
 		apply_central_force(Vector3.UP * maxf(SPRING_K * (ride - ground_dist) - SPRING_D * linear_velocity.y, -40.0))
@@ -266,7 +290,35 @@ func _physics_process(dt: float) -> void:
 			var ldir := hvel / hspeed if hspeed > 0.5 else forward()
 			var fwd_imp := minf(LEAP_FWD_BASE + LEAP_FWD_SPEED * hspeed, LEAP_FWD_MAX)
 			apply_central_impulse((Vector3.UP * LEAP_UP + ldir * fwd_imp) * mass)
+			_takeoff_t = 0.25
 			_event("leap", -1, hspeed, 0.0)
+
+	# --- Edge sense: probe ground ahead along travel for refused drops. ---
+	cliff_ahead = false
+	_cliff_dist = INF
+	if grounded and ground != null:
+		var probe_dir := hvel / hspeed if hspeed > 0.5 else forward()
+		var here_h: float = ground.floor_at(global_position.x, global_position.z)
+		var horizon := clampf(hspeed * 1.2 + 1.5, 4.0, 9.0)
+		var d := 0.5
+		while d <= horizon:
+			var p := global_position + probe_dir * d
+			if here_h - ground.floor_at(p.x, p.z) > CLIFF_DROP:
+				cliff_ahead = true
+				_cliff_dist = d
+				break
+			d += 0.5
+	if not cliff_ahead:
+		leap_armed = false
+	refusing = cliff_ahead and not leap_armed and not gathering and grounded
+
+	# Armed leap: the machine starts its gather so the launch lands on the
+	# lip. The 1.6 m pad absorbs the edge sensor's cell-quantization bias.
+	if leap_armed and grounded and not gathering:
+		if _cliff_dist <= hspeed * GATHER_TIME + 1.6:
+			leap_armed = false
+			gathering = true
+			_gather_t = 0.0
 
 	# --- Slide: stance held on a steep descent with speed. ---
 	if sliding:
@@ -352,7 +404,16 @@ func _physics_process(dt: float) -> void:
 			var m_drag: float = SURF_DRAG[surface] * (STANCE_DRAG_MULT if stance_active else 1.0)
 			var m_grip: float = SURF_GRIP[surface] * (STANCE_GRIP_MULT if stance_active else 1.0)
 			var m_thrust: float = SURF_THRUST[surface] * (STANCE_THRUST_MULT if stance_active else 1.0)
-			_stance_forces(hvel, hspeed, fwd, throttle, brake, reversing, m_thrust)
+			var throttle_eff := throttle
+			if refusing:
+				# No forward drive toward a refused edge, and brake to stand
+				# before the lip. Capped: reckless speed can still carry over.
+				throttle_eff = 0.0
+				if hspeed > 0.05:
+					var stop_d := maxf(_cliff_dist - CLIFF_STOP_MARGIN, 0.1)
+					var needed := hspeed * hspeed / (2.0 * stop_d)
+					apply_central_force(-hvel / hspeed * minf(needed, CLIFF_BRAKE) * mass)
+			_stance_forces(hvel, hspeed, fwd, throttle_eff, brake, reversing, m_thrust)
 			# Resistance and grip as forces (never write linear_velocity — the
 			# property is a pre-tick cache; writes clobber this tick's forces).
 			apply_central_force(-hvel * DRAG * m_drag * planted_fraction * mass)

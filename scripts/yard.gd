@@ -70,6 +70,14 @@ func height_at(wx: float, wz: float) -> float:
 	return lerpf(lerpf(h00, h10, tx), lerpf(h01, h11, tx), tz)
 
 
+## Nearest-cell height — crisp at terrace lips, for edge sensing (bilinear
+## smearing hides a cliff until the probe is well past the lip).
+func floor_at(wx: float, wz: float) -> float:
+	var xi := clampi(roundi(wx + SIZE * 0.5), 0, RES - 1)
+	var zi := clampi(roundi(wz + SIZE * 0.5), 0, RES - 1)
+	return heights[zi * RES + xi]
+
+
 func surface_at(wx: float, wz: float) -> int:
 	var xi := clampi(roundi(wx + SIZE * 0.5), 0, RES - 1)
 	var zi := clampi(roundi(wz + SIZE * 0.5), 0, RES - 1)

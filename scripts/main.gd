@@ -64,6 +64,40 @@ func _ready() -> void:
 		_shot_sequence(outdir)
 	elif gauntlet:
 		_gauntlet_sequence()
+	elif args.has("--edgetest"):
+		_edge_test()
+
+
+## End-to-end edge contract on the COMMIT gap: refusal stops before the lip;
+## a run-up armed leap clears it onto tower B.
+func _edge_test() -> void:
+	await _frames(10)
+	_respawn(Vector3(0, 0, -18), 0.0)  # tower A top, facing the gap (lip z -28)
+	await _frames(5)
+	_hold("throttle")
+	await _frames(420)
+	var pz := walker.global_position.z
+	print("EDGE stop: z=%.1f (lip -28) speed=%.2f state=%s" % [pz, walker.linear_velocity.length(), walker.state_name()])
+	_unhold("throttle")
+	await _frames(30)
+	_respawn(Vector3(0, 0, -9), 0.0)  # full runway across the tower top
+	await _frames(5)
+	_hold("throttle")
+	var guard := 0
+	while walker.global_position.z > -22.0 and guard < 600:
+		await _frames(2)
+		guard += 2
+	walker.request_leap()
+	print("EDGE req: z=%.1f v=%.2f cliff=%s dist=%.1f state=%s" % [walker.global_position.z, walker.linear_velocity.length(), walker.cliff_ahead, walker._cliff_dist, walker.state_name()])
+	for k in 20:
+		await _frames(15)
+		var q := walker.global_position
+		print("EDGE t+%d: z=%.1f y=%.1f v=%.2f state=%s cliff=%s" % [(k + 1) * 15, q.z, q.y, walker.linear_velocity.length(), walker.state_name(), walker.cliff_ahead])
+	_unhold("throttle")
+	var p := walker.global_position
+	var landed := p.y > 4.0 and p.z < -32.0
+	print("EDGE leap: pos=(%.1f, %.1f, %.1f) %s" % [p.x, p.y, p.z, "LANDED TOWER B" if landed else "FELL"])
+	get_tree().quit()
 
 
 func _respawn(spawn: Vector3, heading: float) -> void:
@@ -136,7 +170,10 @@ func _update_hud(speed: float) -> void:
 	for lane_name in _lane_times:
 		lines.append("%s  best %5.1f  last %5.1f" % [lane_name, _lane_times[lane_name].best, _lane_times[lane_name].last])
 	var surf_names := ["hard", "soft", "slick"]
-	lines.append("speed %4.1f   %s   ground: %s" % [speed, walker.state_name(), surf_names[walker.surface]])
+	var state := walker.state_name()
+	if walker.refusing:
+		state += "  —  [Shift] to commit"
+	lines.append("speed %4.1f   %s   ground: %s" % [speed, state, surf_names[walker.surface]])
 	hud.text = "\n".join(lines)
 
 
