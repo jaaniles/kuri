@@ -88,6 +88,9 @@ class Foot:
 	var last_step_len := 0.0
 
 
+# Optional ground provider (anything with height_at(x, z)). When null the
+# world is flat at y=0 — exactly the approved baseline behavior.
+var ground: Node3D = null
 var heading := 0.0
 var feet: Array[Foot] = []
 var planted_fraction := 1.0
@@ -122,9 +125,24 @@ func forward() -> Vector3:
 	return Vector3(-sin(heading), 0.0, -cos(heading))
 
 
+## Test-harness support: plant all feet at their homes after a teleport.
+## Never called during normal play.
+func snap_feet() -> void:
+	for i in 4:
+		feet[i].swinging = false
+		feet[i].swing_t = 0.0
+		feet[i].pos = _home(i)
+
+
+func _ground_h(wx: float, wz: float) -> float:
+	return ground.height_at(wx, wz) if ground != null else 0.0
+
+
 func _home(i: int) -> Vector3:
 	var off := Basis(Vector3.UP, heading) * (FEET_LOCAL[i] as Vector3)
-	return Vector3(global_position.x + off.x, 0.0, global_position.z + off.z)
+	var wx := global_position.x + off.x
+	var wz := global_position.z + off.z
+	return Vector3(wx, _ground_h(wx, wz), wz)
 
 
 func _physics_process(dt: float) -> void:
@@ -285,7 +303,7 @@ func _begin_step(i: int, hvel: Vector3) -> void:
 	f.swinging = true
 	f.swing_t = 0.0
 	f.swing_from = f.pos
-	f.swing_to = Vector3(target.x, 0.0, target.z)
+	f.swing_to = Vector3(target.x, _ground_h(target.x, target.z), target.z)
 	f.swing_dur = swing_time
 	f.last_step_len = (f.swing_to - f.pos).length()
 	step_count += 1

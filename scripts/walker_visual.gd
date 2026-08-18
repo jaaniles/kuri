@@ -134,7 +134,7 @@ func _process(dt: float) -> void:
 		var foot_state: WalkerBody.Foot = body.feet[i]
 		var foot := foot_state.pos
 		if foot_state.swinging:
-			foot.y = sin(foot_state.swing_t * PI) * STEP_HEIGHT
+			foot.y += sin(foot_state.swing_t * PI) * STEP_HEIGHT
 		var anchor: Vector3 = body.FEET_LOCAL[i]
 		var seg := _hind if body.IS_HIND[i] else _fore
 		var hip := seg.global_transform * Vector3(anchor.x, HIP_HEIGHT - CHASSIS_HEIGHT, anchor.z)
