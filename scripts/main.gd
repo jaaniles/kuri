@@ -105,12 +105,39 @@ func _edge_test() -> void:
 	_unhold("throttle")
 	var p := walker.global_position
 	print("EDGE held-leap: pos=(%.1f, %.1f, %.1f) vmax=%.1f %s" % [p.x, p.y, p.z, vmax, "LANDED TOWER B" if p.y > 4.0 and p.z < -32.0 else "FELL"])
-	_respawn(Vector3(0, 0, -51), 0.0)  # tower B top, facing the 5 m drop (lip z -53)
+	_respawn(Vector3(3, 0, -58), 0.0)  # tower C top, facing the 2.5 m free drop (lip z -60)
 	await _frames(20)
-	walker.request_leap()
-	await _frames(260)
+	_hold("throttle")
+	await _frames(420)
 	var q := walker.global_position
-	print("EDGE drop-consent: pos=(%.1f, %.1f, %.1f) %s" % [q.x, q.y, q.z, "DROPPED OK" if q.y < 2.0 and q.z < -53.0 else "STUCK"])
+	print("EDGE free-drop: pos=(%.1f, %.1f, %.1f) %s" % [q.x, q.y, q.z, "DROPPED OK" if q.y < 1.6 and q.z < -60.0 else "STUCK"])
+	_unhold("throttle")
+	# Full COMMIT run: ramp, choke, gap 1, short tower, gap 2, drop, finish.
+	_respawn(Vector3(0, 0, 20), 0.0)
+	await _frames(10)
+	_hold("throttle")
+	_hold("leap")
+	var reached_b := false
+	var reached_c := false
+	var g := 0
+	while g < 2600:
+		await _frames(5)
+		g += 5
+		var r := walker.global_position
+		if g % 60 == 0:
+			print("  run t=%4.1f z=%6.1f y=%4.1f v=%4.1f %-14s cliff=%s d=%.1f" % [
+				g / 60.0, r.z, r.y, walker.linear_velocity.length(), walker.state_name(),
+				walker.cliff_ahead, walker._cliff_dist])
+		if r.z < -34.0 and r.z > -43.0 and r.y > 4.0:
+			reached_b = true
+		if r.z < -48.0 and r.y > 2.0 and r.y < 4.5:
+			reached_c = true
+		if r.z < -70.0:
+			break
+	_unhold("leap")
+	_unhold("throttle")
+	var e := walker.global_position
+	print("COMMIT run: end=(%.1f, %.1f, %.1f) towerB=%s towerC=%s finished=%s" % [e.x, e.y, e.z, reached_b, reached_c, e.z < -70.0])
 	get_tree().quit()
 
 
@@ -294,6 +321,9 @@ func _shot_sequence(outdir: String) -> void:
 	# Regression track: flat hub strip, eastward.
 	_respawn(HARNESS_SPAWN, -PI * 0.5)
 	await _frames(10)
+	await _measure_accel()
+	_respawn(HARNESS_SPAWN, -PI * 0.5)
+	await _frames(10)
 	# Steady-state bands via partial throttle: walk, then trot, then full.
 	_hold("throttle", 0.25)
 	await _frames(300)
@@ -336,6 +366,28 @@ func _shot_sequence(outdir: String) -> void:
 	await _frames(5)
 	await _capture(outdir, "yard_overview")
 	get_tree().quit()
+
+
+## Standstill launch profile: time to reach speed gates, and terminal speed.
+func _measure_accel() -> void:
+	_hold("throttle", 1.0)
+	var gates := [1.0, 2.0, 3.0, 4.0]
+	var hit := {}
+	var f := 0
+	while f < 900:
+		await _frames(3)
+		f += 3
+		var v := Vector3(walker.linear_velocity.x, 0, walker.linear_velocity.z).length()
+		for g in gates:
+			if not hit.has(g) and v >= g:
+				hit[g] = f / 60.0
+	var parts := PackedStringArray()
+	for g in gates:
+		parts.append("%.0f m/s @ %s s" % [g, ("%.2f" % hit[g]) if hit.has(g) else "never"])
+	var vtop := Vector3(walker.linear_velocity.x, 0, walker.linear_velocity.z).length()
+	print("ACCEL %s | top %.2f" % [" | ".join(parts), vtop])
+	_unhold("throttle")
+	await _frames(60)
 
 
 func _setup_hud() -> void:

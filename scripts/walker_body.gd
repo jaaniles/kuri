@@ -63,6 +63,12 @@ const GALLOP_JOIN := 0.5
 # Force.
 const THRUST_PER_LEG := 1.2
 const THRUST_GAIT := 0.5        # thrust *= (1 + this * gait)
+# Launch authority: legs push hardest against a standing body and lose
+# purchase as contact time shrinks with speed (muscle force-velocity).
+# Raises standstill acceleration without touching top speed, which is set
+# by thrust-vs-drag at the high end.
+const LAUNCH_BOOST := 1.8
+const LAUNCH_FADE := 2.2        # m/s at which the boost is fully gone
 const BRAKE_PER_LEG := 2.0
 const REVERSE_FACTOR := 0.5
 const DRAG := 0.7
@@ -585,7 +591,8 @@ func _drift(i: int) -> float:
 ## ---------------------------------------------------------------- FORCE ---
 func _stance_forces(hvel: Vector3, hspeed: float, fwd: Vector3, throttle: float, brake: float, reversing: bool, thrust_mult := 1.0) -> void:
 	var travel := hvel / hspeed if hspeed > 0.15 else fwd
-	var thrust := THRUST_PER_LEG * (1.0 + THRUST_GAIT * gait) * thrust_mult
+	var launch := lerpf(LAUNCH_BOOST, 1.0, clampf(hspeed / LAUNCH_FADE, 0.0, 1.0))
+	var thrust := THRUST_PER_LEG * (1.0 + THRUST_GAIT * gait) * thrust_mult * launch
 	for i in 4:
 		var f := feet[i]
 		if f.swinging:

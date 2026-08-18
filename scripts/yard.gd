@@ -158,14 +158,19 @@ func _build_flow() -> void:
 
 
 func _build_commit() -> void:
-	# Ramp up to tower A (L2), choke on top, 5 m leap gap to tower B,
-	# then a 5 m drop to the floor sprint. Failing the leap lands in the
-	# pit at floor level - side corridors let you continue, slowly.
+	# The mount owns leap TIMING, so the skill lives in arriving correctly:
+	#   ramp up -> drift right to thread an offset choke at speed ->
+	#   5 m leap -> land on a SHORT tower (10 m, so landing speed is the
+	#   whole budget) -> 4 m leap down a level -> free drop -> sprint.
+	# An unbraced hard landing bleeds speed and costs you the second gap.
+	# Towers stay within x -12..12 so the side corridors remain the slow
+	# ground route for a failed leap.
 	_ramp(Rect2(-6, -8, 12, 16), 2, 0, false)    # 18 degree, two levels
 	_plateau(Rect2(-12, -28, 24, 20), 2)         # tower A
-	_plateau(Rect2(-12, -16, 8, 3), 3)           # choke block west
-	_plateau(Rect2(4, -16, 8, 3), 3)             # choke block east
-	_plateau(Rect2(-12, -53, 24, 20), 2)         # tower B (gap z -33..-28)
+	_plateau(Rect2(-12, -25, 9.5, 3), 3)         # choke west  (gap x 0.5..5.5)
+	_plateau(Rect2(5.5, -25, 6.5, 3), 3)         # choke east
+	_plateau(Rect2(-12, -43, 24, 10), 2)         # tower B, short (gap 1: -33..-28)
+	_plateau(Rect2(-12, -60, 24, 13), 1)         # tower C, a level lower (gap 2: -47..-43)
 
 
 func _build_grind() -> void:
