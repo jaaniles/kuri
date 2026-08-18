@@ -358,7 +358,13 @@ func _shot_sequence(outdir: String) -> void:
 	await _frames(80)
 	await _capture(outdir, "brake")
 	_unhold("brake")
-	print("ASSERT knee_max_jump=%.3f" % visual.max_knee_frame_jump)
+	# sim_extension is the hard bound: the sim must never ask for a foot the
+	# leg cannot reach. render_extension additionally includes chassis dip,
+	# flex and lean, so it runs a little higher; the renderer clamps at 0.99
+	# so nothing can draw stretched either way.
+	print("ASSERT knee_jump=%.3f sim_extension=%.3f (MUST be <= 1.0) render_extension=%.3f at [%s]" % [
+		visual.max_knee_frame_jump, walker.sim_max_extension, visual.max_leg_extension,
+		visual.max_leg_extension_state])
 	# Yard overview for geometry integrity checks.
 	_cam_manual = true
 	cam.global_position = Vector3(0, 130, 80)

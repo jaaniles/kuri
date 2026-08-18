@@ -49,6 +49,7 @@ const REGIME_HYST := 0.08
 # Stepping.
 const STEP_RANGE := 0.55
 const OVERSTRETCH := 1.6
+const REACH_URGENT := 0.88      # extension fraction at which a leg must step regardless of pattern
 const DUTY_WALK := 0.68
 const DUTY_TROT := 0.52
 const DUTY_GALLOP := 0.32
@@ -111,6 +112,19 @@ const GUIDED_VMAX := 7.0        # cap on guided launch speed (legality bound)
 const AIR_STEER := 0.15
 const LAND_RETENTION_HARD := 0.82  # unbraced hard landing bleeds speed
 const HARD_LANDING_VY := 4.0
+# Airborne legs. Four phases, all derived from existing state — no new clock:
+#   PUSH   feet stay world-locked briefly after launch, so the body rising
+#          against them reads as the push-off
+#   TUCK   ascending: feet fold under the hips, body-relative (this is what
+#          stops the feet being glued to the takeoff point)
+#   REACH  descending: feet extend toward the predicted touchdown footprint
+#   ABSORB contact: feet plant where they land, body dips on the spring
+const TAKEOFF_GRACE := 0.25     # suspension stays released this long after launch
+const PUSH_HOLD := 0.10         # of which this much is the push-off
+const AIR_FOOT_RATE := 9.0      # how fast feet reach their air pose (1/s)
+const TUCK_DROP := 0.45         # tucked foot hangs this far below its hip
+const TUCK_GATHER := 0.18       # ...and this much inboard and rearward
+const FALL_G := 9.8             # gravity used for touchdown prediction only
 # Surfaces (index = Yard.SURF_*): hard, soft, slick.
 const SURF_DRAG := [1.0, 2.3, 0.55]
 const SURF_GRIP := [1.0, 1.15, 0.22]
@@ -167,6 +181,7 @@ var _was_grounded := true
 var _prev_vy := 0.0
 var _slide_exit_t := 0.0
 var _cliff_dist := INF
+var sim_max_extension := 0.0  # diagnostic: worst hip-to-foot / leg length, sim side
 
 var _tick := 0
 var _log: FileAccess
@@ -260,6 +275,62 @@ func state_name() -> String:
 
 func _ground_h(wx: float, wz: float) -> float:
 	return ground.height_at(wx, wz) if ground != null else 0.0
+
+
+## World position of leg i's hip.
+func _hip_world(i: int) -> Vector3:
+	var anchor: Vector3 = FEET_LOCAL[i]
+	var off := Basis(Vector3.UP, heading) * anchor
+	return Vector3(global_position.x + off.x,
+		global_position.y - RIDE_HEIGHT + HIP_HEIGHT,
+		global_position.z + off.z)
+
+
+## Ballistic touchdown estimate: two passes, because the landing height
+## depends on where you land. Prediction only — never feeds the sim.
+func _predict_landing(hvel: Vector3) -> Vector3:
+	var vy := linear_velocity.y
+	var gy := _ground_h(global_position.x, global_position.z)
+	var t := 0.0
+	for _pass in 2:
+		var dy := maxf(global_position.y - RIDE_HEIGHT - gy, 0.0)
+		t = clampf((vy + sqrt(maxf(vy * vy + 2.0 * FALL_G * dy, 0.0))) / FALL_G, 0.0, 1.5)
+		var lp := global_position + hvel * t
+		gy = _ground_h(lp.x, lp.z)
+	var land := global_position + hvel * t
+	return Vector3(land.x, gy, land.z)
+
+
+## Pull a foot back inside the leg's horizontal reach envelope, keeping it
+## at its own height. A leg cannot be longer than itself — swing targets are
+## forecast from instantaneous velocity and frozen, so a deceleration during
+## the swing would otherwise strand the foot ahead of the body. This is a
+## constraint on the result, NOT a re-target: the swing path stays frozen.
+func _clamp_to_reach(i: int, p: Vector3) -> Vector3:
+	var hip := _hip_world(i)
+	var reach := (UPPER_LEN + LOWER_LEN) * 0.95
+	var vert := hip.y - p.y
+	var max_h := sqrt(maxf(reach * reach - vert * vert, 0.04))
+	var d := Vector2(p.x - hip.x, p.z - hip.z)
+	if d.length() <= max_h:
+		return p
+	d = d.normalized() * max_h
+	return Vector3(hip.x + d.x, p.y, hip.z + d.y)
+
+
+## Where foot i belongs while airborne: folded under the hip while rising,
+## reaching for the touchdown footprint while falling. Always inside reach.
+func _air_foot_target(i: int, hvel: Vector3) -> Vector3:
+	var hip := _hip_world(i)
+	var yaw := Basis(Vector3.UP, heading)
+	var anchor: Vector3 = FEET_LOCAL[i]
+	var target: Vector3
+	if linear_velocity.y > 0.0:
+		target = hip + Vector3(0.0, -TUCK_DROP, 0.0) \
+			+ yaw * Vector3(-signf(anchor.x) * TUCK_GATHER, 0.0, TUCK_GATHER)
+	else:
+		target = _predict_landing(hvel) + yaw * Vector3(anchor.x, 0.0, anchor.z)
+	return hip + (target - hip).limit_length((UPPER_LEN + LOWER_LEN) * 0.95)
 
 
 func _home(i: int) -> Vector3:
@@ -387,7 +458,7 @@ func _physics_process(dt: float) -> void:
 				fwd_imp = clampf(_gather_boost - hspeed, LEAP_FWD_BASE, GUIDED_VMAX)
 				_gather_boost = 0.0
 			apply_central_impulse((Vector3.UP * up_imp + ldir * fwd_imp) * mass)
-			_takeoff_t = 0.25
+			_takeoff_t = TAKEOFF_GRACE
 			_event("leap", -1, hspeed, 0.0)
 
 	# --- Slide: stance held on a steep descent with speed. ---
@@ -429,18 +500,26 @@ func _physics_process(dt: float) -> void:
 	for f in feet:
 		if not f.swinging:
 			planted += 1
-	planted_fraction = planted / 4.0
+	# Airborne means unweighted: nothing is carrying load, whatever the feet
+	# happen to be doing. Feeds the chassis settle and the spine.
+	planted_fraction = (planted / 4.0) if grounded else 0.0
 	var turn_rate := TURN_RATE
 	if sliding:
 		turn_rate = SLIDE_TURN
 	elif stance_active and grounded:
 		turn_rate = TURN_RATE * STANCE_TURN_MULT
-	var authority := planted_fraction * (1.0 if grounded else AIR_STEER)
+	var authority := planted_fraction if grounded else AIR_STEER
 	heading = wrapf(heading + steer * turn_rate * authority * dt, -PI, PI)
 	var fwd := forward()
 
-	# --- Feet. Locked under the body while sliding or gathering. ---
-	if sliding or gathering:
+	# --- Feet. Airborne: push, then tuck or reach. Grounded: step. ---
+	if not grounded:
+		if _takeoff_t <= TAKEOFF_GRACE - PUSH_HOLD:
+			for i in 4:
+				var f := feet[i]
+				f.swinging = false
+				f.pos = f.pos.lerp(_air_foot_target(i, hvel), 1.0 - exp(-AIR_FOOT_RATE * dt))
+	elif sliding or gathering:
 		for i in 4:
 			var f := feet[i]
 			f.swinging = false
@@ -457,6 +536,13 @@ func _physics_process(dt: float) -> void:
 				else:
 					var t := f.swing_t * f.swing_t * (3.0 - 2.0 * f.swing_t)
 					f.pos = f.swing_from.lerp(f.swing_to, t)
+
+	# Geometric backstop over EVERY foot, planted included: a leg cannot be
+	# longer than itself. With the urgent-step rule above this should almost
+	# never bind — but a scheduling failure must degrade into a dragged foot,
+	# never into a stretched limb.
+	for i in 4:
+		feet[i].pos = _clamp_to_reach(i, feet[i].pos)
 
 	if grounded:
 		if sliding:
@@ -489,6 +575,10 @@ func _physics_process(dt: float) -> void:
 			apply_central_force(-hvel * DRAG * m_drag * planted_fraction * mass)
 			var lat := hvel - fwd * hvel.dot(fwd)
 			apply_central_force(-lat * GRIP * m_grip * planted_fraction * mass)
+
+	for i in 4:
+		sim_max_extension = maxf(sim_max_extension,
+			(feet[i].pos - _hip_world(i)).length() / (UPPER_LEN + LOWER_LEN))
 
 	_prev_vy = linear_velocity.y
 	_was_grounded = grounded
@@ -545,12 +635,18 @@ func _step_triggers(hvel: Vector3) -> void:
 		var f := feet[i]
 		if f.swinging:
 			continue
-		if planted_now - 1 < floor_n:
-			continue
 		var drift := _drift(i)
-		if drift < STEP_RANGE * _trigger_factor(i):
+		# A leg at the end of its reach must step, whatever the gait pattern
+		# would prefer. The support floor and the co-swing rules are style;
+		# leg length is geometry, and geometry wins. Without this a foot can
+		# be blocked while the body walks away and the leg stretches.
+		var urgent := drift > STEP_RANGE * OVERSTRETCH \
+			or _extension(i) > REACH_URGENT
+		if not urgent and planted_now - 1 < floor_n:
 			continue
-		if _may_lift(i) or drift > STEP_RANGE * OVERSTRETCH:
+		if drift < STEP_RANGE * _trigger_factor(i) and not urgent:
+			continue
+		if _may_lift(i) or urgent:
 			_begin_step(i, hvel)
 			planted_now -= 1
 
@@ -586,6 +682,11 @@ func _begin_step(i: int, hvel: Vector3) -> void:
 func _drift(i: int) -> float:
 	var d := feet[i].pos - _home(i)
 	return Vector2(d.x, d.z).length()
+
+
+## Hip-to-foot distance as a fraction of total leg length. 1.0 = straight.
+func _extension(i: int) -> float:
+	return (feet[i].pos - _hip_world(i)).length() / (UPPER_LEN + LOWER_LEN)
 
 
 ## ---------------------------------------------------------------- FORCE ---

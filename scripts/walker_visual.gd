@@ -30,7 +30,12 @@ const FLEX_SMOOTH := 10.0
 const SETTLE_DEPTH := 0.09      # chassis sink at zero support
 const DIP_K := 70.0
 const DIP_D := 11.0
-const YAW_FOLLOW := 3.5
+## Chassis yaw lag behind heading, in radians at full steering deflection.
+## The follow rate is DERIVED from the sim's turn rate (steady-state lag =
+## turn_rate / follow_rate) so that retuning steering cannot silently leave
+## the body pointing the wrong way — which is what happened when TURN_RATE
+## was tripled against a follow rate tuned for the old value.
+const YAW_LAG_RAD := 0.22
 const LEAN_K := 0.22            # roll toward the support centroid (rad/m)
 const PITCH_ACCEL := 0.035
 ## ---------------------------------------------------------------------------
@@ -48,9 +53,16 @@ class LegMeshes:
 # sim-side metric looks clean.
 var max_knee_frame_jump := 0.0
 
+# Output-side assertion: worst hip-to-foot distance as a fraction of total
+# leg length. Must stay <= 1.0 — anything above means the sim asked for a
+# foot the leg cannot reach, which renders as a stretched limb.
+var max_leg_extension := 0.0
+var max_leg_extension_state := ""
+
 var _legs: Array[LegMeshes] = []
 var _prev_knees: Array = []
 var _prev_body_pos := Vector3.INF
+var _settle_frames := 0  # grace after a teleport; both metrics are meaningless there
 var _chassis: Node3D
 var _fore: Node3D
 var _hind: Node3D
@@ -90,7 +102,7 @@ func _process(dt: float) -> void:
 		return
 	var hvel := Vector3(body.linear_velocity.x, 0.0, body.linear_velocity.z)
 
-	_yaw = lerp_angle(_yaw, body.heading, 1.0 - exp(-YAW_FOLLOW * dt))
+	_yaw = lerp_angle(_yaw, body.heading, 1.0 - exp(-(body.TURN_RATE / YAW_LAG_RAD) * dt))
 	if dt > 0.0001:
 		_acc_smooth = _acc_smooth.lerp((hvel - _prev_hvel) / dt, 1.0 - exp(-6.0 * dt))
 	_prev_hvel = hvel
@@ -127,6 +139,8 @@ func _process(dt: float) -> void:
 			front_dz += (local.z - rest_z) * 0.5
 	var engage := clampf((body.gait - FLEX_GAIT_ON) / (FLEX_GAIT_FULL - FLEX_GAIT_ON), 0.0, 1.0)
 	var flex_target := clampf((front_dz - hind_dz) * FLEX_K, -FLEX_MAX, FLEX_MAX) * engage
+	if not body.grounded:
+		flex_target = 0.0  # no in-flight spine pose is authored; don't let feet invent one
 	_flex = lerpf(_flex, flex_target, 1.0 - exp(-FLEX_SMOOTH * dt))
 
 	var fwd := body.forward()
@@ -137,6 +151,11 @@ func _process(dt: float) -> void:
 	_fore.rotation.x = -_flex * 0.5
 	_hind.rotation.x = _flex * 0.5
 
+	if not _prev_body_pos.is_finite() or (body.global_position - _prev_body_pos).length() > 2.0:
+		_settle_frames = 4
+	else:
+		_settle_frames = maxi(_settle_frames - 1, 0)
+
 	for i in 4:
 		var foot_state: WalkerBody.Foot = body.feet[i]
 		var foot := foot_state.pos
@@ -145,6 +164,18 @@ func _process(dt: float) -> void:
 		var anchor: Vector3 = body.FEET_LOCAL[i]
 		var seg := _hind if body.IS_HIND[i] else _fore
 		var hip := seg.global_transform * Vector3(anchor.x, HIP_HEIGHT - CHASSIS_HEIGHT, anchor.z)
+		# Measure what the sim asked for, then render only what the leg can
+		# actually do. Without the clamp an unreachable foot renders as a
+		# stretched shin; without the measurement the stretch is invisible.
+		var reach := UPPER_LEN + LOWER_LEN
+		var ext := (foot - hip).length() / reach
+		if ext > max_leg_extension and _settle_frames == 0:
+			max_leg_extension = ext
+			var horiz := Vector2(foot.x - hip.x, foot.z - hip.z).length()
+			max_leg_extension_state = "%s leg%d %s horiz=%.2f vert=%.2f gait=%.2f" % [
+				body.state_name(), i, "swing" if foot_state.swinging else "plant",
+				horiz, hip.y - foot.y, body.gait]
+		foot = hip + (foot - hip).limit_length(reach * 0.99)
 		_render_leg(_legs[i], hip, foot, signf(anchor.x), i)
 	_prev_body_pos = body.global_position
 
@@ -155,8 +186,7 @@ func _track_knee(i: int, knee: Vector3) -> void:
 		for k in 4:
 			_prev_knees[k] = Vector3.INF
 	var prev: Vector3 = _prev_knees[i]
-	var teleported := not _prev_body_pos.is_finite() or (body.global_position - _prev_body_pos).length() > 2.0
-	if prev.is_finite() and not teleported:
+	if prev.is_finite() and _settle_frames == 0:
 		max_knee_frame_jump = maxf(max_knee_frame_jump, (knee - prev).length())
 	_prev_knees[i] = knee
 
