@@ -10,23 +10,35 @@ var visual: WalkerVisual
 var cam: Camera3D
 var cam_height := 26.0
 var cam_pitch := 70.0  # degrees from horizontal; 90 = straight down
+var hud: Label
 var _cam_focus := Vector3.ZERO
 var _cam_manual := false
+
+
+const PLAYER_SPAWN := Vector3(0, 0, 74)   # hub centre, facing the lanes
+const HARNESS_SPAWN := Vector3(-70, 0, 74)  # flat hub strip, eastward run
+
+# Lane stopwatch.
+var _lane_times := {}  # name -> {"best": float, "last": float}
+var _active_lane := ""
+var _lane_t0 := 0
+var _prev_z := 0.0
 
 
 func _ready() -> void:
 	_setup_input()
 	_setup_world()
 
-	yard = Yard.new()
-	add_child(yard)
+	var args := OS.get_cmdline_user_args()
+	var gauntlet := args.has("--gauntlet")
+	if not gauntlet:
+		yard = Yard.new()
+		add_child(yard)
 
 	walker = WalkerBody.new()
 	walker.ground = yard
 	add_child(walker)
-	# Spawn on the flat east corridor (clear run for regression harness).
-	walker.global_position = Vector3(60, WalkerBody.RIDE_HEIGHT, 72)
-	walker.snap_feet()
+	_respawn(PLAYER_SPAWN, 0.0)
 
 	visual = WalkerVisual.new()
 	visual.body = walker
@@ -41,7 +53,8 @@ func _ready() -> void:
 	cam.global_position = walker.global_position + Vector3(0, cam_height, 0)
 	cam.current = true
 
-	var args := OS.get_cmdline_user_args()
+	_setup_hud()
+
 	if args.has("--shot"):
 		var outdir := "user://"
 		var i := args.find("--outdir")
@@ -49,8 +62,20 @@ func _ready() -> void:
 			outdir = args[i + 1]
 		walker.enable_logging(outdir)
 		_shot_sequence(outdir)
-	elif args.has("--gauntlet"):
+	elif gauntlet:
 		_gauntlet_sequence()
+
+
+func _respawn(spawn: Vector3, heading: float) -> void:
+	var gy: float = yard.height_at(spawn.x, spawn.z) if yard else 0.0
+	walker.global_position = Vector3(spawn.x, gy + WalkerBody.RIDE_HEIGHT, spawn.z)
+	walker.linear_velocity = Vector3.ZERO
+	walker.heading = heading
+	walker.reset_state()
+	walker.snap_feet()
+	_active_lane = ""
+	_cam_focus = walker.global_position
+	_prev_z = spawn.z
 
 
 func _process(dt: float) -> void:
@@ -60,6 +85,8 @@ func _process(dt: float) -> void:
 		cam_pitch = clampf(cam_pitch - 5.0, 55.0, 90.0)
 	if Input.is_action_just_pressed("tilt_up"):
 		cam_pitch = clampf(cam_pitch + 5.0, 55.0, 90.0)
+	if Input.is_action_just_pressed("reset"):
+		_respawn(PLAYER_SPAWN, 0.0)
 	var bp := walker.global_position
 	var hvel := Vector3(walker.linear_velocity.x, 0, walker.linear_velocity.z)
 	var target := bp + hvel * 0.35
@@ -67,6 +94,50 @@ func _process(dt: float) -> void:
 	var p := deg_to_rad(cam_pitch)
 	cam.global_position = _cam_focus + Vector3(0, sin(p), cos(p)) * cam_height
 	cam.rotation_degrees = Vector3(-cam_pitch, 0, 0)
+	_update_stopwatch(bp)
+	_update_hud(hvel.length())
+
+
+func _update_stopwatch(p: Vector3) -> void:
+	if yard == null:
+		return
+	if _active_lane == "":
+		if _prev_z > Yard.LANE_Z_START and p.z <= Yard.LANE_Z_START:
+			for l in Yard.LANES:
+				if p.x >= l.x0 and p.x <= l.x1:
+					_active_lane = l.name
+					_lane_t0 = Time.get_ticks_msec()
+	else:
+		var lane: Dictionary = {}
+		for l in Yard.LANES:
+			if l.name == _active_lane:
+				lane = l
+		if p.x < lane.x0 or p.x > lane.x1 or p.z > Yard.LANE_Z_START + 4.0:
+			_active_lane = ""  # left the lane
+		elif p.z <= Yard.LANE_Z_END:
+			var t := (Time.get_ticks_msec() - _lane_t0) / 1000.0
+			if not _lane_times.has(_active_lane):
+				_lane_times[_active_lane] = {"best": t, "last": t}
+			else:
+				_lane_times[_active_lane].last = t
+				_lane_times[_active_lane].best = minf(_lane_times[_active_lane].best, t)
+			_active_lane = ""
+	_prev_z = p.z
+
+
+func _update_hud(speed: float) -> void:
+	if hud == null:
+		return
+	var lines := PackedStringArray()
+	if _active_lane != "":
+		lines.append("%s   %5.1f s" % [_active_lane, (Time.get_ticks_msec() - _lane_t0) / 1000.0])
+	else:
+		lines.append("pick a lane ^   FLOW / COMMIT / GRIND")
+	for lane_name in _lane_times:
+		lines.append("%s  best %5.1f  last %5.1f" % [lane_name, _lane_times[lane_name].best, _lane_times[lane_name].last])
+	var surf_names := ["hard", "soft", "slick"]
+	lines.append("speed %4.1f   %s   ground: %s" % [speed, walker.state_name(), surf_names[walker.surface]])
+	hud.text = "\n".join(lines)
 
 
 func _unhandled_input(event: InputEvent) -> void:
@@ -83,6 +154,9 @@ func _setup_input() -> void:
 	_add_action("brake", [KEY_S, KEY_DOWN])
 	_add_action("turn_left", [KEY_A, KEY_LEFT])
 	_add_action("turn_right", [KEY_D, KEY_RIGHT])
+	_add_action("stance", [KEY_SPACE])
+	_add_action("leap", [KEY_SHIFT])
+	_add_action("reset", [KEY_R])
 	_add_action("tilt_down", [KEY_Q])
 	_add_action("tilt_up", [KEY_E])
 
@@ -167,6 +241,8 @@ func _frames(n: int) -> void:
 
 
 func _shot_sequence(outdir: String) -> void:
+	# Regression track: flat hub strip, eastward.
+	_respawn(HARNESS_SPAWN, -PI * 0.5)
 	await _frames(10)
 	# Steady-state bands via partial throttle: walk, then trot, then full.
 	_hold("throttle", 0.25)
@@ -176,28 +252,66 @@ func _shot_sequence(outdir: String) -> void:
 	await _frames(300)
 	await _capture(outdir, "trot_steady")
 	_hold("throttle", 1.0)
-	await _frames(400)
+	await _frames(350)
 	await _capture(outdir, "gallop")
 	_hold("turn_left")
 	await _frames(70)
 	await _capture(outdir, "gallop_turn")
 	_unhold("turn_left")
-	await _frames(150)
+	await _frames(80)
 	await _capture(outdir, "gallop_straight")
+	# Verb: stance at speed (expect speed to settle lower, state "stance").
+	_hold("stance")
+	await _frames(150)
+	await _capture(outdir, "stance_hold")
+	_unhold("stance")
+	await _frames(60)
+	# Verb: leap (gather -> flight -> landing).
+	walker.request_leap()
+	await _frames(30)
+	await _capture(outdir, "leap_flight")
+	await _frames(80)
+	await _capture(outdir, "leap_landed")
 	_unhold("throttle")
-	await _frames(120)
-	await _capture(outdir, "coast_down")
+	await _frames(100)
 	_hold("brake")
 	await _frames(80)
 	await _capture(outdir, "brake")
 	_unhold("brake")
+	print("ASSERT knee_max_jump=%.3f" % visual.max_knee_frame_jump)
 	# Yard overview for geometry integrity checks.
 	_cam_manual = true
-	cam.global_position = Vector3(0, 110, 75)
-	cam.rotation_degrees = Vector3(-60, 0, 0)
+	cam.global_position = Vector3(0, 130, 80)
+	cam.rotation_degrees = Vector3(-62, 0, 0)
 	await _frames(5)
 	await _capture(outdir, "yard_overview")
 	get_tree().quit()
+
+
+func _setup_hud() -> void:
+	var layer := CanvasLayer.new()
+	add_child(layer)
+	hud = Label.new()
+	hud.position = Vector2(14, 10)
+	var ls := LabelSettings.new()
+	ls.font_size = 16
+	ls.shadow_color = Color(0, 0, 0, 0.6)
+	ls.shadow_offset = Vector2(1, 1)
+	hud.label_settings = ls
+	layer.add_child(hud)
+
+	var help := Label.new()
+	help.text = "[W/S] drive+brake  [A/D] steer  [Space hold] stance / downhill slide  [Shift] leap  [R] restart  [Q/E] camera pitch  [wheel] zoom"
+	var hs := LabelSettings.new()
+	hs.font_size = 13
+	hs.shadow_color = Color(0, 0, 0, 0.6)
+	hs.shadow_offset = Vector2(1, 1)
+	help.label_settings = hs
+	help.set_anchors_and_offsets_preset(Control.PRESET_BOTTOM_LEFT)
+	help.offset_left = 14
+	help.offset_top = -34
+	help.offset_bottom = -10
+	layer.add_child(help)
 
 
 # --- Ramp gauntlet: measures what grade the FROZEN movement model climbs. ---

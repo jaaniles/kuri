@@ -68,6 +68,35 @@ const REVERSE_FACTOR := 0.5
 const DRAG := 0.7
 const GRIP := 6.0
 const TURN_RATE := 0.9
+# Verbs (Courier traversal contract on this model). Stance is a hold: lower,
+# grip, sharper turning, lower top speed. On a steep descent with speed it
+# becomes a controlled slide with carve steering. Leap is a committed launch:
+# brief gather, takeoff along current velocity, minimal air authority.
+const STANCE_DRAG_MULT := 1.7
+const STANCE_GRIP_MULT := 1.9
+const STANCE_TURN_MULT := 1.5
+const STANCE_THRUST_MULT := 0.6
+const STANCE_CROUCH := 0.22
+const SLIDE_MIN_SPEED := 3.0
+const SLIDE_ENTER_NY := 0.972   # ground normal.y below this (~13.5 deg) allows slide
+const SLIDE_EXIT_NY := 0.985
+const SLIDE_DRAG := 0.08
+const SLIDE_GRIP := 1.6
+const SLIDE_TURN := 1.1
+const SLIDE_GRAVITY := 3.0      # extra downhill pull while sliding
+const GATHER_TIME := 0.22
+const LEAP_UP := 4.2
+const LEAP_FWD_BASE := 1.2
+const LEAP_FWD_SPEED := 0.35
+const LEAP_FWD_MAX := 3.2
+const LEAP_COOLDOWN := 0.7
+const AIR_STEER := 0.15
+const LAND_RETENTION_HARD := 0.82  # unbraced hard landing bleeds speed
+const HARD_LANDING_VY := 4.0
+# Surfaces (index = Yard.SURF_*): hard, soft, slick.
+const SURF_DRAG := [1.0, 2.3, 0.55]
+const SURF_GRIP := [1.0, 1.15, 0.22]
+const SURF_THRUST := [1.0, 0.75, 0.9]
 ## ---------------------------------------------------------------------------
 
 # FL, FR, BL, BR. Diagonals 0-3 / 1-2; lateral pairs 0-1 (front), 2-3 (hind).
@@ -99,6 +128,17 @@ var gait := 0.0                 # continuous: 0 walk, 1 trot, 2 gallop
 var regime := Regime.WALK
 var lead_side := -1             # -1: left front leads, +1: right front
 var step_count := 0
+var stance_active := false
+var sliding := false
+var gathering := false
+var surface := 0                # Yard.SURF_* under the body
+
+var _gather_t := 0.0
+var _leap_cd := 0.0
+var _leap_queued := false
+var _was_grounded := true
+var _prev_vy := 0.0
+var _slide_exit_t := 0.0
 
 var _tick := 0
 var _log: FileAccess
@@ -134,6 +174,36 @@ func snap_feet() -> void:
 		feet[i].pos = _home(i)
 
 
+## Clear verb state (teleports, resets).
+func reset_state() -> void:
+	stance_active = false
+	sliding = false
+	gathering = false
+	_gather_t = 0.0
+	_leap_cd = 0.0
+	_leap_queued = false
+	gait = 0.0
+	regime = Regime.WALK
+
+
+## Leap request — from input or the test harness.
+func request_leap() -> void:
+	if grounded and not gathering and _leap_cd <= 0.0:
+		_leap_queued = true
+
+
+func state_name() -> String:
+	if not grounded:
+		return "air"
+	if gathering:
+		return "gather"
+	if sliding:
+		return "slide"
+	if stance_active:
+		return "stance"
+	return "run"
+
+
 func _ground_h(wx: float, wz: float) -> float:
 	return ground.height_at(wx, wz) if ground != null else 0.0
 
@@ -147,24 +217,68 @@ func _home(i: int) -> Vector3:
 
 func _physics_process(dt: float) -> void:
 	_tick += 1
+	_leap_cd = maxf(_leap_cd - dt, 0.0)
 
-	# --- Suspension. ---
+	# --- Suspension (stance/gather crouch lowers the ride). ---
 	var space := get_world_3d().direct_space_state
 	var q := PhysicsRayQueryParameters3D.create(global_position, global_position + Vector3.DOWN * GROUND_RAY_LEN)
 	q.exclude = [get_rid()]
 	var hit := space.intersect_ray(q)
-	grounded = not hit.is_empty() and global_position.y - hit.position.y < RIDE_HEIGHT + 0.4
+	var ground_dist: float = global_position.y - hit.position.y if not hit.is_empty() else INF
+	grounded = ground_dist < RIDE_HEIGHT + 0.4
+	var ride := RIDE_HEIGHT - (STANCE_CROUCH if (stance_active or gathering) else 0.0)
 	if grounded:
-		var compression: float = RIDE_HEIGHT - (global_position.y - hit.position.y)
-		apply_central_force(Vector3.UP * maxf(SPRING_K * compression - SPRING_D * linear_velocity.y, -40.0))
+		apply_central_force(Vector3.UP * maxf(SPRING_K * (ride - ground_dist) - SPRING_D * linear_velocity.y, -40.0))
 
 	# --- Inputs. ---
 	var throttle := Input.get_action_strength("throttle")
 	var brake := Input.get_action_strength("brake")
 	var steer := Input.get_axis("turn_right", "turn_left")
+	stance_active = Input.is_action_pressed("stance")
+	if Input.is_action_just_pressed("leap"):
+		request_leap()
 	var hvel := Vector3(linear_velocity.x, 0.0, linear_velocity.z)
 	var hspeed := hvel.length()
 	var reversing := brake > 0.0 and hspeed < 0.4
+
+	# --- Ground context. ---
+	surface = ground.surface_at(global_position.x, global_position.z) if ground != null else 0
+	var gn: Vector3 = ground.normal_at(global_position.x, global_position.z) if ground != null else Vector3.UP
+
+	# --- Landing: unbraced hard landings bleed speed; stance absorbs. ---
+	if grounded and not _was_grounded:
+		if -_prev_vy > HARD_LANDING_VY and not stance_active and hspeed > 0.05:
+			apply_central_impulse(-hvel / hspeed * hspeed * (1.0 - LAND_RETENTION_HARD) * mass)
+			_event("hard_land", -1, -_prev_vy, hspeed)
+
+	# --- Leap: gather, then committed launch along current velocity. ---
+	if _leap_queued and grounded:
+		_leap_queued = false
+		gathering = true
+		_gather_t = 0.0
+	if gathering:
+		_gather_t += dt
+		if not grounded:
+			gathering = false
+		elif _gather_t >= GATHER_TIME:
+			gathering = false
+			_leap_cd = LEAP_COOLDOWN
+			var ldir := hvel / hspeed if hspeed > 0.5 else forward()
+			var fwd_imp := minf(LEAP_FWD_BASE + LEAP_FWD_SPEED * hspeed, LEAP_FWD_MAX)
+			apply_central_impulse((Vector3.UP * LEAP_UP + ldir * fwd_imp) * mass)
+			_event("leap", -1, hspeed, 0.0)
+
+	# --- Slide: stance held on a steep descent with speed. ---
+	if sliding:
+		_slide_exit_t = _slide_exit_t + dt if gn.y > SLIDE_EXIT_NY else 0.0
+		if not grounded or not stance_active or brake > 0.3 or hspeed < 2.0 or _slide_exit_t > 0.3:
+			sliding = false
+	elif grounded and stance_active and not gathering and hspeed > SLIDE_MIN_SPEED and gn.y < SLIDE_ENTER_NY:
+		var downhill := (Vector3.DOWN - gn * Vector3.DOWN.dot(gn)).normalized()
+		if hvel.dot(downhill) > 0.3 * hspeed:
+			sliding = true
+			_slide_exit_t = 0.0
+			_event("slide_on", -1, hspeed, 0.0)
 
 	# --- Gait parameter follows MEASURED speed. Input never touches it. ---
 	var g_target: float
@@ -188,37 +302,65 @@ func _physics_process(dt: float) -> void:
 	if absf(steer) > 0.3:
 		lead_side = -1 if steer > 0.0 else 1  # lead into the turn
 
-	# --- Support + steering through planted feet. ---
+	# --- Support + steering through planted feet. Committed in the air. ---
 	var planted := 0
 	for f in feet:
 		if not f.swinging:
 			planted += 1
 	planted_fraction = planted / 4.0
-	heading = wrapf(heading + steer * TURN_RATE * planted_fraction * dt, -PI, PI)
+	var turn_rate := TURN_RATE
+	if sliding:
+		turn_rate = SLIDE_TURN
+	elif stance_active and grounded:
+		turn_rate = TURN_RATE * STANCE_TURN_MULT
+	var authority := planted_fraction * (1.0 if grounded else AIR_STEER)
+	heading = wrapf(heading + steer * turn_rate * authority * dt, -PI, PI)
 	var fwd := forward()
 
-	# --- Advance swings. ---
-	for i in 4:
-		var f := feet[i]
-		if f.swinging:
-			f.swing_t += dt / f.swing_dur
-			if f.swing_t >= 1.0:
-				f.swinging = false
-				f.pos = f.swing_to
-				_event("footfall", i, f.last_step_len, hspeed)
-			else:
-				var t := f.swing_t * f.swing_t * (3.0 - 2.0 * f.swing_t)
-				f.pos = f.swing_from.lerp(f.swing_to, t)
+	# --- Feet. Locked under the body while sliding or gathering. ---
+	if sliding or gathering:
+		for i in 4:
+			var f := feet[i]
+			f.swinging = false
+			f.pos = f.pos.lerp(_home(i), 1.0 - exp(-10.0 * dt))
+	else:
+		for i in 4:
+			var f := feet[i]
+			if f.swinging:
+				f.swing_t += dt / f.swing_dur
+				if f.swing_t >= 1.0:
+					f.swinging = false
+					f.pos = f.swing_to
+					_event("footfall", i, f.last_step_len, hspeed)
+				else:
+					var t := f.swing_t * f.swing_t * (3.0 - 2.0 * f.swing_t)
+					f.pos = f.swing_from.lerp(f.swing_to, t)
 
 	if grounded:
-		_step_triggers(hvel)
-		_stance_forces(hvel, hspeed, fwd, throttle, brake, reversing)
-		# Resistance and grip as forces (never write linear_velocity — the
-		# property is a pre-tick cache; writes clobber this tick's forces).
-		apply_central_force(-hvel * DRAG * planted_fraction * mass)
-		var lat := hvel - fwd * hvel.dot(fwd)
-		apply_central_force(-lat * GRIP * planted_fraction * mass)
+		if sliding:
+			# Carve: glide with extra downhill pull, soft lateral grip.
+			var downhill := Vector3.DOWN - gn * Vector3.DOWN.dot(gn)
+			if downhill.length() > 0.01:
+				apply_central_force(downhill.normalized() * SLIDE_GRAVITY * mass)
+			apply_central_force(-hvel * SLIDE_DRAG * mass)
+			var lat_s := hvel - fwd * hvel.dot(fwd)
+			apply_central_force(-lat_s * SLIDE_GRIP * mass)
+		elif gathering:
+			apply_central_force(-hvel * DRAG * mass)
+		else:
+			_step_triggers(hvel)
+			var m_drag: float = SURF_DRAG[surface] * (STANCE_DRAG_MULT if stance_active else 1.0)
+			var m_grip: float = SURF_GRIP[surface] * (STANCE_GRIP_MULT if stance_active else 1.0)
+			var m_thrust: float = SURF_THRUST[surface] * (STANCE_THRUST_MULT if stance_active else 1.0)
+			_stance_forces(hvel, hspeed, fwd, throttle, brake, reversing, m_thrust)
+			# Resistance and grip as forces (never write linear_velocity — the
+			# property is a pre-tick cache; writes clobber this tick's forces).
+			apply_central_force(-hvel * DRAG * m_drag * planted_fraction * mass)
+			var lat := hvel - fwd * hvel.dot(fwd)
+			apply_central_force(-lat * GRIP * m_grip * planted_fraction * mass)
 
+	_prev_vy = linear_velocity.y
+	_was_grounded = grounded
 	_log_tick(hspeed, throttle)
 
 
@@ -316,9 +458,9 @@ func _drift(i: int) -> float:
 
 
 ## ---------------------------------------------------------------- FORCE ---
-func _stance_forces(hvel: Vector3, hspeed: float, fwd: Vector3, throttle: float, brake: float, reversing: bool) -> void:
+func _stance_forces(hvel: Vector3, hspeed: float, fwd: Vector3, throttle: float, brake: float, reversing: bool, thrust_mult := 1.0) -> void:
 	var travel := hvel / hspeed if hspeed > 0.15 else fwd
-	var thrust := THRUST_PER_LEG * (1.0 + THRUST_GAIT * gait)
+	var thrust := THRUST_PER_LEG * (1.0 + THRUST_GAIT * gait) * thrust_mult
 	for i in 4:
 		var f := feet[i]
 		if f.swinging:
@@ -338,7 +480,7 @@ func _stance_forces(hvel: Vector3, hspeed: float, fwd: Vector3, throttle: float,
 ## ------------------------------------------------------- INSTRUMENTATION --
 func enable_logging(dir: String) -> void:
 	_log = FileAccess.open(dir.path_join("loco_ticks.csv"), FileAccess.WRITE)
-	_log.store_line("tick,gait,regime,speed,vy,y,support,throttle,l0s,l0x,l0z,l0st,l1s,l1x,l1z,l1st,l2s,l2x,l2z,l2st,l3s,l3x,l3z,l3st")
+	_log.store_line("tick,gait,regime,speed,vy,y,support,throttle,l0s,l0x,l0z,l0st,l1s,l1x,l1z,l1st,l2s,l2x,l2z,l2st,l3s,l3x,l3z,l3st,stance,slide,gather,surf")
 	_elog = FileAccess.open(dir.path_join("loco_events.csv"), FileAccess.WRITE)
 	_elog.store_line("tick,event,leg,a,b")
 
@@ -362,6 +504,7 @@ func _log_tick(hspeed: float, throttle: float) -> void:
 		var hip := Vector3(FEET_LOCAL[i].x, HIP_HEIGHT, FEET_LOCAL[i].z)
 		var stretch := (Vector3(local.x, f.pos.y, local.z) - hip).length() / max_leg
 		parts.append("%d,%.2f,%.2f,%.2f" % [1 if f.swinging else 0, local.x, local.z, stretch])
+	parts.append("%d,%d,%d,%d" % [1 if stance_active else 0, 1 if sliding else 0, 1 if gathering else 0, surface])
 	_log.store_line(",".join(parts))
 	if _tick % 120 == 0:
 		_log.flush()

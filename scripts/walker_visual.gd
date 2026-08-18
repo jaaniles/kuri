@@ -43,7 +43,14 @@ class LegMeshes:
 	var pad: MeshInstance3D
 
 
+# Output-side assertion: worst single-frame knee position jump (metres),
+# teleports excluded. A snap in the rendered legs shows here even when every
+# sim-side metric looks clean.
+var max_knee_frame_jump := 0.0
+
 var _legs: Array[LegMeshes] = []
+var _prev_knees: Array = []
+var _prev_body_pos := Vector3.INF
 var _chassis: Node3D
 var _fore: Node3D
 var _hind: Node3D
@@ -138,13 +145,27 @@ func _process(dt: float) -> void:
 		var anchor: Vector3 = body.FEET_LOCAL[i]
 		var seg := _hind if body.IS_HIND[i] else _fore
 		var hip := seg.global_transform * Vector3(anchor.x, HIP_HEIGHT - CHASSIS_HEIGHT, anchor.z)
-		_render_leg(_legs[i], hip, foot, signf(anchor.x))
+		_render_leg(_legs[i], hip, foot, signf(anchor.x), i)
+	_prev_body_pos = body.global_position
 
 
-func _render_leg(lm: LegMeshes, hip: Vector3, foot: Vector3, side: float) -> void:
+func _track_knee(i: int, knee: Vector3) -> void:
+	if _prev_knees.size() < 4:
+		_prev_knees.resize(4)
+		for k in 4:
+			_prev_knees[k] = Vector3.INF
+	var prev: Vector3 = _prev_knees[i]
+	var teleported := not _prev_body_pos.is_finite() or (body.global_position - _prev_body_pos).length() > 2.0
+	if prev.is_finite() and not teleported:
+		max_knee_frame_jump = maxf(max_knee_frame_jump, (knee - prev).length())
+	_prev_knees[i] = knee
+
+
+func _render_leg(lm: LegMeshes, hip: Vector3, foot: Vector3, side: float, leg_index: int) -> void:
 	# Knees bow mostly rearward, slightly outward.
 	var hint := _chassis.global_transform.basis * Vector3(side * 0.25, 0.0, 0.9)
 	var knee := _solve_knee(hip, foot, hint)
+	_track_knee(leg_index, knee)
 	_place_limb(lm.upper, hip, knee)
 	_place_limb(lm.lower, knee, foot + Vector3(0, 0.06, 0))
 	lm.pad.global_position = foot + Vector3(0, 0.06, 0)
