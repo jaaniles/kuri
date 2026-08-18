@@ -68,35 +68,49 @@ func _ready() -> void:
 		_edge_test()
 
 
-## End-to-end edge contract on the COMMIT gap: refusal stops before the lip;
-## a run-up armed leap clears it onto tower B.
+## End-to-end edge contract on the COMMIT gap:
+##   A refusal stops before the lip without intent
+##   B standing consent at a too-wide gap explains itself, no jump
+##   C held intent keeps momentum; the machine launches at the lip
+##   D standing consent at a sheer drop hops off
 func _edge_test() -> void:
 	await _frames(10)
 	_respawn(Vector3(0, 0, -18), 0.0)  # tower A top, facing the gap (lip z -28)
 	await _frames(5)
 	_hold("throttle")
 	await _frames(420)
-	var pz := walker.global_position.z
-	print("EDGE stop: z=%.1f (lip -28) speed=%.2f state=%s" % [pz, walker.linear_velocity.length(), walker.state_name()])
+	print("EDGE stop: z=%.1f (lip -28) speed=%.2f state=%s" % [walker.global_position.z, walker.linear_velocity.length(), walker.state_name()])
 	_unhold("throttle")
 	await _frames(30)
+	await _frames(90)  # let residual speed decay to a true standstill
+	walker.request_leap()
+	await _frames(60)
+	print("EDGE standing-gap: z=%.1f y=%.1f state=%s hint='%s'" % [walker.global_position.z, walker.global_position.y, walker.state_name(), walker.edge_hint])
 	_respawn(Vector3(0, 0, -9), 0.0)  # full runway across the tower top
 	await _frames(5)
 	_hold("throttle")
 	var guard := 0
-	while walker.global_position.z > -22.0 and guard < 600:
+	while walker.global_position.z > -18.0 and guard < 600:
 		await _frames(2)
 		guard += 2
-	walker.request_leap()
-	print("EDGE req: z=%.1f v=%.2f cliff=%s dist=%.1f state=%s" % [walker.global_position.z, walker.linear_velocity.length(), walker.cliff_ahead, walker._cliff_dist, walker.state_name()])
-	for k in 20:
+	_hold("leap")  # held intent from 10 m out: no refusal, launch at the lip
+	var vmax := 0.0
+	for k in 22:
 		await _frames(15)
-		var q := walker.global_position
-		print("EDGE t+%d: z=%.1f y=%.1f v=%.2f state=%s cliff=%s" % [(k + 1) * 15, q.z, q.y, walker.linear_velocity.length(), walker.state_name(), walker.cliff_ahead])
+		vmax = maxf(vmax, walker.linear_velocity.length())
+		if not walker.grounded:
+			break
+	await _frames(150)
+	_unhold("leap")
 	_unhold("throttle")
 	var p := walker.global_position
-	var landed := p.y > 4.0 and p.z < -32.0
-	print("EDGE leap: pos=(%.1f, %.1f, %.1f) %s" % [p.x, p.y, p.z, "LANDED TOWER B" if landed else "FELL"])
+	print("EDGE held-leap: pos=(%.1f, %.1f, %.1f) vmax=%.1f %s" % [p.x, p.y, p.z, vmax, "LANDED TOWER B" if p.y > 4.0 and p.z < -32.0 else "FELL"])
+	_respawn(Vector3(0, 0, -51), 0.0)  # tower B top, facing the 5 m drop (lip z -53)
+	await _frames(20)
+	walker.request_leap()
+	await _frames(260)
+	var q := walker.global_position
+	print("EDGE drop-consent: pos=(%.1f, %.1f, %.1f) %s" % [q.x, q.y, q.z, "DROPPED OK" if q.y < 2.0 and q.z < -53.0 else "STUCK"])
 	get_tree().quit()
 
 
@@ -170,10 +184,9 @@ func _update_hud(speed: float) -> void:
 	for lane_name in _lane_times:
 		lines.append("%s  best %5.1f  last %5.1f" % [lane_name, _lane_times[lane_name].best, _lane_times[lane_name].last])
 	var surf_names := ["hard", "soft", "slick"]
-	var state := walker.state_name()
-	if walker.refusing:
-		state += "  —  [Shift] to commit"
-	lines.append("speed %4.1f   %s   ground: %s" % [speed, state, surf_names[walker.surface]])
+	lines.append("speed %4.1f   %s   ground: %s" % [speed, walker.state_name(), surf_names[walker.surface]])
+	if walker.edge_hint != "":
+		lines.append(walker.edge_hint)
 	hud.text = "\n".join(lines)
 
 

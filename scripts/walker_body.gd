@@ -97,6 +97,11 @@ const LEAP_COOLDOWN := 0.7
 const CLIFF_DROP := 3.0         # drops deeper than this are refused (one terrace stays free)
 const CLIFF_BRAKE := 9.0        # refusal braking (m/s^2 cap)
 const CLIFF_STOP_MARGIN := 1.1  # aim to stand this far before the lip
+const ARM_SCAN := 12.0          # a leap press with an edge within this arms instead of hopping
+const STANDING_JUMP_MAX := 3.0  # guided standing jump clears gaps up to this (measured)
+const GAP_SCAN := 6.5           # how far past a lip to look for a landable far side
+const GUIDED_UP := 5.2          # guided standing jump gets a taller arc
+const GUIDED_VMAX := 7.0        # cap on guided launch speed (legality bound)
 const AIR_STEER := 0.15
 const LAND_RETENTION_HARD := 0.82  # unbraced hard landing bleeds speed
 const HARD_LANDING_VY := 4.0
@@ -142,11 +147,16 @@ var surface := 0                # Yard.SURF_* under the body
 var cliff_ahead := false
 var leap_armed := false
 var refusing := false
+var edge_hint := ""
 
 var _gather_t := 0.0
 var _takeoff_t := 0.0  # suspension released briefly at launch, or the spring damper eats the leap
 var _leap_cd := 0.0
-var _leap_queued := false
+var _leap_pressed := false
+var _intent_t := 0.0   # sticky leap intent after a press near an edge
+var _gather_boost := 0.0  # guided standing jump: computed launch speed
+var _edge_dir := Vector3.FORWARD
+var _edge_dist12 := INF
 var _was_grounded := true
 var _prev_vy := 0.0
 var _slide_exit_t := 0.0
@@ -191,22 +201,39 @@ func reset_state() -> void:
 	stance_active = false
 	sliding = false
 	gathering = false
+	leap_armed = false
+	refusing = false
 	_gather_t = 0.0
 	_leap_cd = 0.0
-	_leap_queued = false
+	_leap_pressed = false
+	_intent_t = 0.0
+	_gather_boost = 0.0
+	_takeoff_t = 0.0
 	gait = 0.0
 	regime = Regime.WALK
 
 
-## Leap request — from input or the test harness. With an edge ahead this
-## ARMS the leap (the machine times its own takeoff at the lip); otherwise
-## it gathers and launches immediately.
+## Width of the gap past the sensed lip, or -1.0 when no landable far side
+## exists within GAP_SCAN (a sheer drop). Uses bilinear height: crisp cells
+## quantize back onto the near lip and hallucinate a tiny gap.
+func _measure_gap() -> float:
+	if ground == null or _edge_dist12 == INF:
+		return -1.0
+	var here_h: float = ground.height_at(global_position.x, global_position.z)
+	var d := _edge_dist12 + 1.0
+	while d <= _edge_dist12 + GAP_SCAN:
+		var p := global_position + _edge_dir * d
+		if here_h - ground.height_at(p.x, p.z) <= 0.6:
+			return d - _edge_dist12
+		d += 0.5
+	return -1.0
+
+
+## Leap request — from input or the test harness. Processed after edge
+## sensing: with an edge within ARM_SCAN this arms intent (the machine times
+## its own takeoff); otherwise it hops immediately.
 func request_leap() -> void:
-	if grounded and not gathering and _leap_cd <= 0.0:
-		if cliff_ahead:
-			leap_armed = true
-		else:
-			_leap_queued = true
+	_leap_pressed = true
 
 
 func state_name() -> String:
@@ -275,11 +302,70 @@ func _physics_process(dt: float) -> void:
 			apply_central_impulse(-hvel / hspeed * hspeed * (1.0 - LAND_RETENTION_HARD) * mass)
 			_event("hard_land", -1, -_prev_vy, hspeed)
 
-	# --- Leap: gather, then committed launch along current velocity. ---
-	if _leap_queued and grounded:
-		_leap_queued = false
-		gathering = true
-		_gather_t = 0.0
+	# --- Edge sense: probe along travel for refused drops (crisp cells). ---
+	cliff_ahead = false
+	_cliff_dist = INF
+	_edge_dist12 = INF
+	if grounded and ground != null:
+		_edge_dir = hvel / hspeed if hspeed > 0.5 else forward()
+		var here_h: float = ground.floor_at(global_position.x, global_position.z)
+		var horizon := clampf(hspeed * 1.2 + 1.5, 4.0, 9.0)
+		var d := 0.5
+		while d <= ARM_SCAN:
+			var p := global_position + _edge_dir * d
+			if here_h - ground.floor_at(p.x, p.z) > CLIFF_DROP:
+				_edge_dist12 = d
+				break
+			d += 0.5
+		if _edge_dist12 <= horizon:
+			cliff_ahead = true
+			_cliff_dist = _edge_dist12
+
+	# --- Leap intent: held or recently pressed. A press with an edge in
+	# reach arms; a press in open ground hops immediately. ---
+	_intent_t = maxf(_intent_t - dt, 0.0)
+	var leap_intent := Input.is_action_pressed("leap") or _intent_t > 0.0
+	if _leap_pressed:
+		_leap_pressed = false
+		if grounded and not gathering and _leap_cd <= 0.0:
+			if _edge_dist12 < ARM_SCAN:
+				_intent_t = 1.5
+				leap_intent = true
+			else:
+				gathering = true
+				_gather_t = 0.0
+	leap_armed = grounded and not gathering and cliff_ahead and leap_intent
+	refusing = grounded and not gathering and cliff_ahead and not leap_intent
+	edge_hint = "refusing edge — hold Shift to commit" if refusing else ""
+
+	if leap_armed and hspeed >= 1.5:
+		# Moving: the machine times its gather so launch happens at the lip
+		# (1.6 m pad absorbs the sensor's cell-quantization bias).
+		if _cliff_dist <= hspeed * GATHER_TIME + 1.6:
+			gathering = true
+			_gather_t = 0.0
+	elif leap_armed and _cliff_dist < 4.0:
+		# Standing at a refused edge: guided jump when the far side is inside
+		# the standing envelope; hop-off when it is a sheer drop; otherwise
+		# say why not.
+		var gap := _measure_gap()
+		if gap < 0.0:
+			# Sheer drop: consented hop-off, scaled to actually clear the lip.
+			_gather_boost = (_cliff_dist + 1.0) / 0.9
+			gathering = true
+			_gather_t = 0.0
+		else:
+			var needed := _cliff_dist + gap + 1.0  # GUIDED_UP airtime ~1.0 s
+			if needed <= GUIDED_VMAX and gap <= STANDING_JUMP_MAX:
+				_gather_boost = needed
+				gathering = true
+				_gather_t = 0.0
+			else:
+				edge_hint = "too far from standstill — take a run-up"
+	if gathering:
+		_intent_t = 0.0
+
+	# --- Gather, then committed launch. ---
 	if gathering:
 		_gather_t += dt
 		if not grounded:
@@ -287,38 +373,16 @@ func _physics_process(dt: float) -> void:
 		elif _gather_t >= GATHER_TIME:
 			gathering = false
 			_leap_cd = LEAP_COOLDOWN
-			var ldir := hvel / hspeed if hspeed > 0.5 else forward()
+			var ldir := hvel / hspeed if hspeed > 0.5 else _edge_dir
+			var up_imp := LEAP_UP
 			var fwd_imp := minf(LEAP_FWD_BASE + LEAP_FWD_SPEED * hspeed, LEAP_FWD_MAX)
-			apply_central_impulse((Vector3.UP * LEAP_UP + ldir * fwd_imp) * mass)
+			if _gather_boost > 0.0:
+				up_imp = GUIDED_UP
+				fwd_imp = clampf(_gather_boost - hspeed, LEAP_FWD_BASE, GUIDED_VMAX)
+				_gather_boost = 0.0
+			apply_central_impulse((Vector3.UP * up_imp + ldir * fwd_imp) * mass)
 			_takeoff_t = 0.25
 			_event("leap", -1, hspeed, 0.0)
-
-	# --- Edge sense: probe ground ahead along travel for refused drops. ---
-	cliff_ahead = false
-	_cliff_dist = INF
-	if grounded and ground != null:
-		var probe_dir := hvel / hspeed if hspeed > 0.5 else forward()
-		var here_h: float = ground.floor_at(global_position.x, global_position.z)
-		var horizon := clampf(hspeed * 1.2 + 1.5, 4.0, 9.0)
-		var d := 0.5
-		while d <= horizon:
-			var p := global_position + probe_dir * d
-			if here_h - ground.floor_at(p.x, p.z) > CLIFF_DROP:
-				cliff_ahead = true
-				_cliff_dist = d
-				break
-			d += 0.5
-	if not cliff_ahead:
-		leap_armed = false
-	refusing = cliff_ahead and not leap_armed and not gathering and grounded
-
-	# Armed leap: the machine starts its gather so the launch lands on the
-	# lip. The 1.6 m pad absorbs the edge sensor's cell-quantization bias.
-	if leap_armed and grounded and not gathering:
-		if _cliff_dist <= hspeed * GATHER_TIME + 1.6:
-			leap_armed = false
-			gathering = true
-			_gather_t = 0.0
 
 	# --- Slide: stance held on a steep descent with speed. ---
 	if sliding:
